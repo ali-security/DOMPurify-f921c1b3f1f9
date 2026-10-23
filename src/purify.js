@@ -158,6 +158,13 @@ function createDOMPurify(window = getGlobal()) {
     Node && Node.prototype ? lookupGetter(Node.prototype, 'nodeType') : null;
   const getNodeName =
     Node && Node.prototype ? lookupGetter(Node.prototype, 'nodeName') : null;
+  /* Only cache the shadowRoot getter where Shadow DOM exists: lookupGetter's
+     fallback warns on every call, and engines without Shadow DOM have no
+     attached shadow roots to walk anyway. */
+  const getShadowRoot =
+    'shadowRoot' in ElementPrototype
+      ? lookupGetter(ElementPrototype, 'shadowRoot')
+      : null;
 
   // As per issue #47, the web-components registry is inherited by a
   // new document created via createHTMLDocument. As per the spec
@@ -1599,6 +1606,29 @@ function createDOMPurify(window = getGlobal()) {
          recurse into <template>.content from foreign realms too. */
       if (_isDocumentFragment(shadowNode.content)) {
         _sanitizeShadowDOM(shadowNode.content);
+      }
+
+      /* An element iterated here may itself host an attached
+         shadow root. The node iterator does not enter shadow trees,
+         so a shadow root attached to an element inside
+         <template>.content was previously reached by no walk at all
+         (the template-content recursion above iterates the content
+         but never inspected shadowRoot). Walk it explicitly; the
+         recursive call inspects the shadow tree's own elements the
+         same way, so nested shadow roots and templates are reached
+         too. The nodeType guard avoids reading shadowRoot off text /
+         comment / CDATA / PI nodes that the iterator also surfaces.
+         1 === Node.ELEMENT_NODE */
+      const shadowNodeType = getNodeType
+        ? getNodeType(shadowNode)
+        : shadowNode.nodeType;
+      if (shadowNodeType === 1) {
+        const innerSr = getShadowRoot
+          ? getShadowRoot(shadowNode)
+          : shadowNode.shadowRoot;
+        if (_isDocumentFragment(innerSr)) {
+          _sanitizeShadowDOM(innerSr);
+        }
       }
     }
 
