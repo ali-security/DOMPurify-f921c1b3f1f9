@@ -434,6 +434,36 @@
         ' '
       );
     });
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES unterminated template literal',
+      function (assert) {
+        // An opening `${` must be scrubbed up to the end of the string, even
+        // without a closing `}`. Otherwise a `${` left in one node and a `}`
+        // in a later attribute value let the final template scrub cut out the
+        // markup in between, turning attribute content into live HTML (mXSS)
+        var clean = DOMPurify.sanitize(
+          '<b>${</b><a title="}<img src=x onerror=alert(1)>"></a>',
+          { SAFE_FOR_TEMPLATES: true }
+        );
+        assert.contains(clean, [
+          '<b> </b><a title="}<img src=x onerror=alert(1)>"></a>',
+          '<b> </b><a title="}&lt;img src=x onerror=alert(1)&gt;"></a>',
+        ]);
+        var doc = document.implementation.createHTMLDocument('');
+        doc.body.innerHTML = clean;
+        assert.equal(doc.body.getElementsByTagName('img').length, 0);
+        assert.equal(
+          DOMPurify.sanitize('<b>abc${def</b>', { SAFE_FOR_TEMPLATES: true }),
+          '<b>abc </b>'
+        );
+        assert.equal(
+          DOMPurify.sanitize('<a title="abc${def"></a>', {
+            SAFE_FOR_TEMPLATES: true,
+          }),
+          '<a title="abc "></a>'
+        );
+      }
+    );
     QUnit.test('Config-Flag tests: SANITIZE_DOM', function (assert) {
       // SANITIZE_DOM
       assert.equal(
