@@ -1238,18 +1238,22 @@ function createDOMPurify(window = getGlobal()) {
 
     /* Remove element if anything forbids its presence */
     if (!ALLOWED_TAGS[tagName] || FORBID_TAGS[tagName]) {
-      /* Check if we have a custom element to handle */
-      if (!FORBID_TAGS[tagName] && _basicCustomElementTest(tagName)) {
-        if (
-          CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof RegExp &&
-          regExpTest(CUSTOM_ELEMENT_HANDLING.tagNameCheck, tagName)
-        )
-          return false;
-        if (
-          CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof Function &&
-          CUSTOM_ELEMENT_HANDLING.tagNameCheck(tagName)
-        )
-          return false;
+      /* Check if we have a custom element to handle.
+         A custom element kept via CUSTOM_ELEMENT_HANDLING must run
+         through afterSanitizeElements just like a normal allowlisted
+         element, so a security policy applied in this hook is not
+         silently skipped for kept custom elements (GHSA-c2j3-45gr-mqc4).
+         The namespace and fallback-tag removal checks stay skipped. */
+      if (
+        !FORBID_TAGS[tagName] &&
+        _basicCustomElementTest(tagName) &&
+        ((CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof RegExp &&
+          regExpTest(CUSTOM_ELEMENT_HANDLING.tagNameCheck, tagName)) ||
+          (CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof Function &&
+            CUSTOM_ELEMENT_HANDLING.tagNameCheck(tagName)))
+      ) {
+        _executeHook('afterSanitizeElements', currentNode, null);
+        return false;
       }
 
       /* Keep content except for bad-listed elements.

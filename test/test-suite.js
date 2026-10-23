@@ -1344,6 +1344,101 @@
         assert.equal(clean, '');
       }
     );
+
+    // Regression: GHSA-c2j3-45gr-mqc4. A custom element kept via
+    // CUSTOM_ELEMENT_HANDLING must run through afterSanitizeElements just
+    // like a normal allowlisted element, so a security policy layered in
+    // that hook is not silently skipped for kept custom elements.
+    QUnit.test(
+      'afterSanitizeElements fires on kept custom elements CVE-2026-66010',
+      function (assert) {
+        var seen = [];
+        DOMPurify.addHook('afterSanitizeElements', function (node) {
+          if (node.tagName) {
+            seen.push(node.tagName.toLowerCase());
+          }
+        });
+        DOMPurify.sanitize('<x-keep>a</x-keep><div>b</div>', {
+          CUSTOM_ELEMENT_HANDLING: { tagNameCheck: /^x-/ },
+        });
+        DOMPurify.removeAllHooks();
+        assert.ok(
+          seen.indexOf('x-keep') !== -1,
+          'hook must fire on kept custom element, saw: ' + seen.join(',')
+        );
+        assert.ok(seen.indexOf('div') !== -1, 'hook still fires on normal element');
+      }
+    );
+
+    QUnit.test(
+      'afterSanitizeElements policy applies uniformly to custom elements CVE-2026-66010',
+      function (assert) {
+        DOMPurify.addHook('afterSanitizeElements', function (node) {
+          if (node.hasAttribute && node.hasAttribute('data-bio')) {
+            node.removeAttribute('data-bio');
+          }
+        });
+        var clean = DOMPurify.sanitize(
+          '<div data-bio="x"></div><x-bio data-bio="x"></x-bio>',
+          { CUSTOM_ELEMENT_HANDLING: { tagNameCheck: /^x-/ } }
+        );
+        DOMPurify.removeAllHooks();
+        assert.equal(clean, '<div></div><x-bio></x-bio>');
+      }
+    );
+
+    QUnit.test(
+      'afterSanitizeElements policy applies to function tagNameCheck custom elements CVE-2026-66010',
+      function (assert) {
+        DOMPurify.addHook('afterSanitizeElements', function (node) {
+          if (node.hasAttribute && node.hasAttribute('data-bio')) {
+            node.removeAttribute('data-bio');
+          }
+        });
+        var clean = DOMPurify.sanitize(
+          '<div data-bio="x"></div><x-bio data-bio="x"></x-bio>',
+          {
+            CUSTOM_ELEMENT_HANDLING: {
+              tagNameCheck: function (tagName) {
+                return tagName.indexOf('x-') === 0;
+              },
+            },
+          }
+        );
+        DOMPurify.removeAllHooks();
+        assert.equal(clean, '<div></div><x-bio></x-bio>');
+      }
+    );
+
+    QUnit.test(
+      'afterSanitizeElements can remove a kept custom element CVE-2026-66010',
+      function (assert) {
+        DOMPurify.addHook('afterSanitizeElements', function (node) {
+          if (node.tagName && node.tagName.toLowerCase() === 'x-evil') {
+            node.parentNode.removeChild(node);
+          }
+        });
+        var clean = DOMPurify.sanitize('<x-evil>a</x-evil><x-ok>b</x-ok>', {
+          CUSTOM_ELEMENT_HANDLING: { tagNameCheck: /^x-/ },
+        });
+        DOMPurify.removeAllHooks();
+        assert.equal(clean, '<x-ok>b</x-ok>');
+      }
+    );
+
+    QUnit.test(
+      'kept custom element attributes are still sanitized CVE-2026-66010',
+      function (assert) {
+        var clean = DOMPurify.sanitize(
+          '<x-a onclick="alert(1)" href="javascript:alert(1)"><img src=x onerror=alert(1)></x-a>',
+          { CUSTOM_ELEMENT_HANDLING: { tagNameCheck: /^x-/ } }
+        );
+        assert.notOk(/onclick/i.test(clean), 'event handler stripped');
+        assert.notOk(/javascript:/i.test(clean), 'javascript: URI stripped');
+        assert.notOk(/onerror/i.test(clean), 'child payload sanitized');
+      }
+    );
+
     // Test to make sure that ALLOW_ARIA_ATTR is working as expected (#198)
     QUnit.test('Config-Flag tests: ALLOW_ARIA_ATTR', function (assert) {
       assert.contains(
