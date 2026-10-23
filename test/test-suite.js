@@ -1305,6 +1305,22 @@
         '<a href="#">abc</a>'
       );
     });
+    QUnit.test(
+      'Config-Flag tests: USE_PROFILES ALLOWED_ATTR must not inherit from polluted prototypes CVE-2026-65913',
+      function (assert) {
+        Object.prototype.onerror = true;
+        try {
+          var clean = DOMPurify.sanitize('<img src="x" onerror="alert(1)">', {
+            USE_PROFILES: {},
+            ADD_TAGS: ['img'],
+          });
+          assert.equal(clean.indexOf('onerror'), -1);
+          assert.equal(clean, '<img>');
+        } finally {
+          delete Object.prototype.onerror;
+        }
+      }
+    );
     QUnit.test('Config-Flag tests: USE_PROFILES', function (assert) {
       assert.equal(
         DOMPurify.sanitize('<h1>HELLO</h1>', { USE_PROFILES: { html: false } }),
