@@ -464,6 +464,75 @@
         );
       }
     );
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES RETURN_DOM CVE-2026-41239',
+      function (assert) {
+        // RETURN_DOM returns before the final template scrub of the serialized
+        // string, so an expression split across adjacent text nodes (by
+        // elements or comments that get removed) must not survive in the DOM
+        var dom = DOMPurify.sanitize(
+          "<div>{<foo></foo>{constructor.constructor('alert(1)')()}<foo></foo>}</div>",
+          { SAFE_FOR_TEMPLATES: true, RETURN_DOM: true }
+        );
+        assert.equal(dom.outerHTML, '<body> </body>');
+        dom = DOMPurify.sanitize('<div>{<!---->{7*7}<!---->}</div>', {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+        });
+        assert.equal(dom.outerHTML, '<body> </body>');
+        dom = DOMPurify.sanitize('<div>$<foo></foo>{alert(1)}</div>', {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+        });
+        assert.equal(dom.outerHTML, '<body><div> </div></body>');
+        dom = DOMPurify.sanitize('<div>{<foo></foo>{7*7}<foo></foo>}</div>', {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+          WHOLE_DOCUMENT: true,
+        });
+        assert.equal(dom.innerHTML.indexOf('{{'), -1);
+        assert.equal(dom.textContent.indexOf('{{'), -1);
+        // a DOM node input whose text is already split across text nodes
+        var dirty = document.createElement('div');
+        dirty.appendChild(document.createTextNode('{'));
+        dirty.appendChild(document.createTextNode('{7*7}'));
+        dirty.appendChild(document.createTextNode('}'));
+        dom = DOMPurify.sanitize(dirty, {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+        });
+        assert.equal(dom.outerHTML, '<body> </body>');
+        // content without template expressions is left untouched
+        assert.equal(
+          DOMPurify.sanitize('<p>abc</p><p>def</p>', {
+            SAFE_FOR_TEMPLATES: true,
+            RETURN_DOM: true,
+          }).outerHTML,
+          '<body><p>abc</p><p>def</p></body>'
+        );
+      }
+    );
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES RETURN_DOM_FRAGMENT CVE-2026-41239',
+      function (assert) {
+        var fragment = DOMPurify.sanitize(
+          "<div>{<foo></foo>{constructor.constructor('alert(1)')()}<foo></foo>}</div>",
+          { SAFE_FOR_TEMPLATES: true, RETURN_DOM_FRAGMENT: true }
+        );
+        assert.equal(fragment.nodeType, 11);
+        var holder = document.createElement('div');
+        holder.appendChild(fragment);
+        assert.equal(holder.innerHTML, ' ');
+        assert.equal(holder.textContent.indexOf('{{'), -1);
+        fragment = DOMPurify.sanitize('<div>$<foo></foo>{alert(1)}</div>', {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM_FRAGMENT: true,
+        });
+        holder = document.createElement('div');
+        holder.appendChild(fragment);
+        assert.equal(holder.innerHTML, '<div> </div>');
+      }
+    );
     QUnit.test('Config-Flag tests: SANITIZE_DOM', function (assert) {
       // SANITIZE_DOM
       assert.equal(
