@@ -2036,6 +2036,129 @@
       }
     );
 
+    // An allowed <animate>/<set> must not be able to retarget a link's href:
+    // attributeName values containing "href" are dropped. In XHTML mode the
+    // attribute name keeps its case (attributeName), so the guard must not
+    // compare it against 'attributename' only; with
+    // values="x;javascript:..." the last list entry passes the URI check and
+    // becomes the link's effective href (GHSA-c6gr-qvv4-5v3f).
+    QUnit.test(
+      'animated href is blocked in every parser mode (attributeName guard) (GHSA-c6gr-qvv4-5v3f)',
+      function (assert) {
+        var svgNs = 'xmlns="http://www.w3.org/2000/svg"';
+        var animate =
+          '<svg ' +
+          svgNs +
+          '><a id="q"><animate attributeName="href" ' +
+          'values="x;javascript:alert(1)" dur="0.01s" fill="freeze"/>' +
+          '<text x="10" y="40">click</text></a></svg>';
+        var animateXlink =
+          '<svg ' +
+          svgNs +
+          ' xmlns:xlink="http://www.w3.org/1999/xlink"><a id="q">' +
+          '<animate attributeName="xlink:href" ' +
+          'values="x;javascript:alert(1)" dur="0.01s" fill="freeze"/>' +
+          '<text x="10" y="40">click</text></a></svg>';
+        var set =
+          '<svg ' +
+          svgNs +
+          '><a><set attributeName="href" to="x" fill="freeze"/>' +
+          '<text>click</text></a></svg>';
+        var animAttrs = ['values', 'dur', 'fill', 'x', 'y', 'id', 'to'];
+        var configs = [
+          {
+            label: 'XHTML, camelCase ALLOWED_ATTR',
+            cfg: {
+              PARSER_MEDIA_TYPE: 'application/xhtml+xml',
+              ALLOWED_TAGS: ['svg', 'a', 'animate', 'set', 'text'],
+              ALLOWED_ATTR: ['attributeName'].concat(animAttrs),
+            },
+          },
+          {
+            label: 'XHTML, svg profile + ADD_ATTR',
+            cfg: {
+              PARSER_MEDIA_TYPE: 'application/xhtml+xml',
+              USE_PROFILES: { svg: true },
+              ADD_TAGS: ['animate', 'set'],
+              ADD_ATTR: ['attributeName'].concat(animAttrs),
+            },
+          },
+          {
+            // Lets attributeName="xlink:href" through the URI check, so only
+            // the attributeName guard stands between it and the link.
+            label: 'XHTML, ALLOW_UNKNOWN_PROTOCOLS',
+            cfg: {
+              PARSER_MEDIA_TYPE: 'application/xhtml+xml',
+              ALLOWED_TAGS: ['svg', 'a', 'animate', 'set', 'text'],
+              ALLOWED_ATTR: ['attributeName'].concat(animAttrs),
+              ALLOW_UNKNOWN_PROTOCOLS: true,
+            },
+          },
+          {
+            label: 'text/html',
+            cfg: {
+              ALLOWED_TAGS: ['svg', 'a', 'animate', 'set', 'text'],
+              ALLOWED_ATTR: ['attributename'].concat(animAttrs),
+            },
+          },
+        ];
+
+        configs.forEach(function (config) {
+          [animate, animateXlink, set].forEach(function (dirty) {
+            var clean = DOMPurify.sanitize(dirty, config.cfg);
+            assert.notOk(
+              /attributename/i.test(clean),
+              config.label + ': href-targeting attributeName removed: ' + clean
+            );
+          });
+        });
+      }
+    );
+
+    QUnit.test(
+      'XHTML: attributeName that does not target href is kept (GHSA-c6gr-qvv4-5v3f)',
+      function (assert) {
+        // The guard must not over-strip ordinary SVG animations.
+        var clean = DOMPurify.sanitize(
+          '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10">' +
+            '<animate attributeName="opacity" values="0;1" dur="1s"/></rect></svg>',
+          {
+            PARSER_MEDIA_TYPE: 'application/xhtml+xml',
+            USE_PROFILES: { svg: true },
+            ADD_TAGS: ['animate'],
+            ADD_ATTR: ['attributeName', 'values', 'dur'],
+          }
+        );
+        assert.ok(
+          /attributeName="opacity"/.test(clean),
+          'non-href animation kept: ' + clean
+        );
+      }
+    );
+
+    QUnit.test(
+      'XHTML: removed <foreignObject> drops its content like in HTML mode (GHSA-c6gr-qvv4-5v3f)',
+      function (assert) {
+        // FORBID_CONTENTS lists `foreignobject`; in XHTML mode the element is
+        // spelled foreignObject, and its content used to be hoisted into the
+        // SVG parent instead of being dropped.
+        var dirty =
+          '<svg xmlns="http://www.w3.org/2000/svg"><foreignObject>' +
+          '<title>hoisted</title><desc>hoisted</desc>' +
+          '</foreignObject></svg>';
+        ['text/html', 'application/xhtml+xml'].forEach(function (type) {
+          var clean = DOMPurify.sanitize(dirty, {
+            PARSER_MEDIA_TYPE: type,
+            USE_PROFILES: { svg: true },
+          });
+          assert.notOk(
+            /hoisted/.test(clean),
+            type + ': foreignObject content dropped: ' + clean
+          );
+        });
+      }
+    );
+
     QUnit.test('Test invalid xml', function (assert) {
       var tests = [
         {
