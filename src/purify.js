@@ -21,6 +21,42 @@ import {
 
 const getGlobal = () => (typeof window === 'undefined' ? null : window);
 
+/* Known hook entry points. The `hooks` object is populated on demand, so a
+ * plain own-property check against it would reject every legitimate
+ * first-time `addHook()` call. The entry point is therefore validated
+ * against this fixed set of names instead, which also keeps a non-hook key
+ * (e.g. `__proto__`) from resolving off the prototype chain and letting
+ * `arrayPush` write to `Object.prototype`. The set is created with a null
+ * prototype by `addToSet`, so the lookup itself is prototype-safe. */
+const HOOK_ENTRY_POINTS = freeze(
+  addToSet(
+    {},
+    [
+      'beforeSanitizeElements',
+      'uponSanitizeElement',
+      'afterSanitizeElements',
+      'beforeSanitizeAttributes',
+      'uponSanitizeAttribute',
+      'afterSanitizeAttributes',
+      'beforeSanitizeShadowDOM',
+      'uponSanitizeShadowNode',
+      'afterSanitizeShadowDOM',
+    ],
+    stringToString
+  )
+);
+
+/**
+ * _isValidHookEntryPoint
+ * Checks that a caller-supplied hook entry point is one of the known hooks.
+ *
+ * @param  {String} entryPoint entry point to validate
+ * @return {Boolean} true if the entry point is a known hook
+ */
+const _isValidHookEntryPoint = function (entryPoint) {
+  return HOOK_ENTRY_POINTS[entryPoint] === true;
+};
+
 /**
  * Creates a no-op policy for internal use only.
  * Don't export this function outside this module!
@@ -260,6 +296,16 @@ function createDOMPurify(window = getGlobal()) {
   /* Track whether config is already set on this instance of DOMPurify. */
   let SET_CONFIG = false;
 
+  /* Pristine allowlist bindings captured whenever the configuration is
+   * parsed (and therefore also at setConfig() time). Where sanitize() skips
+   * re-deriving the sets - the persistent setConfig() path, or a repeated
+   * call with the very same config object - they are restored from these
+   * before the per-walk hook clone-guard, so a hook's in-call widening
+   * cannot carry across calls. Null until the config is parsed; reset by
+   * clearConfig(). */
+  let PRISTINE_ALLOWED_TAGS = null;
+  let PRISTINE_ALLOWED_ATTR = null;
+
   /* Decide if all elements (e.g. style, script) must be children of
    * document.body. By default, browsers might move them to document.head */
   let FORCE_BODY = false;
@@ -410,6 +456,13 @@ function createDOMPurify(window = getGlobal()) {
   // eslint-disable-next-line complexity
   const _parseConfig = function (cfg) {
     if (CONFIG && CONFIG === cfg) {
+      /* The sets are not re-derived on this path. CONFIG is handed to the
+       * hooks as their third argument, so a caller can pass it straight back
+       * in - restore the sets from the pristine bindings captured when this
+       * config was parsed, otherwise a previous call's hook clone (widened by
+       * a hook) would carry over. */
+      ALLOWED_TAGS = PRISTINE_ALLOWED_TAGS;
+      ALLOWED_ATTR = PRISTINE_ALLOWED_ATTR;
       return;
     }
 
@@ -606,6 +659,12 @@ function createDOMPurify(window = getGlobal()) {
     }
 
     CONFIG = cfg;
+
+    /* Capture the freshly derived allowlists. sanitize() restores the sets
+     * from these whenever it skips re-deriving them, keeping a hook's
+     * in-call widening scoped to the call it happened in. */
+    PRISTINE_ALLOWED_TAGS = ALLOWED_TAGS;
+    PRISTINE_ALLOWED_ATTR = ALLOWED_ATTR;
   };
 
   const MATHML_TEXT_INTEGRATION_POINTS = addToSet({}, [
@@ -935,6 +994,18 @@ function createDOMPurify(window = getGlobal()) {
           typeof object === 'object' &&
           typeof object.nodeType === 'number' &&
           typeof object.nodeName === 'string';
+  };
+
+  /**
+   * _hasHooks
+   * Check whether at least one hook is registered for an entry point.
+   * The `hooks` object is populated on demand, so the array may be absent.
+   *
+   * @param  {String} entryPoint  Name of the hook's entry point
+   * @return {Boolean} true if a hook is registered for the entry point
+   */
+  const _hasHooks = function (entryPoint) {
+    return Boolean(hooks[entryPoint] && hooks[entryPoint].length > 0);
   };
 
   /**
@@ -1444,8 +1515,35 @@ function createDOMPurify(window = getGlobal()) {
     }
 
     /* Assign config vars */
-    if (!SET_CONFIG) {
+    if (SET_CONFIG) {
+      /* Persistent setConfig() path: _parseConfig is skipped, so the sets are
+       * not re-derived per call. Restore them from the pristine bindings
+       * captured at setConfig() time so a previous call's hook clone (mutated
+       * below) does not carry over. */
+      ALLOWED_TAGS = PRISTINE_ALLOWED_TAGS;
+      ALLOWED_ATTR = PRISTINE_ALLOWED_ATTR;
+    } else {
       _parseConfig(cfg);
+    }
+
+    /* Clone the hook-mutable allowlists before the walk whenever an
+     * uponSanitize* hook is registered. The hook event exposes ALLOWED_TAGS
+     * and ALLOWED_ATTR by reference (as allowedTags / allowedAttributes), so
+     * a hook that widens them would otherwise mutate the shared set
+     * permanently: across later calls and across every element. Cloning per
+     * walk keeps documented in-call widening working while scoping it to the
+     * call. A single guard for both config paths - the per-call path rebinds
+     * the sets in _parseConfig each call, the persistent path restores them
+     * from the captured bindings just above - so the two cannot diverge. */
+    if (
+      _hasHooks('uponSanitizeElement') ||
+      _hasHooks('uponSanitizeAttribute')
+    ) {
+      ALLOWED_TAGS = clone(ALLOWED_TAGS);
+    }
+
+    if (_hasHooks('uponSanitizeAttribute')) {
+      ALLOWED_ATTR = clone(ALLOWED_ATTR);
     }
 
     /* Clean up removed elements */
@@ -1602,6 +1700,8 @@ function createDOMPurify(window = getGlobal()) {
   DOMPurify.setConfig = function (cfg) {
     _parseConfig(cfg);
     SET_CONFIG = true;
+    PRISTINE_ALLOWED_TAGS = ALLOWED_TAGS;
+    PRISTINE_ALLOWED_ATTR = ALLOWED_ATTR;
   };
 
   /**
@@ -1612,6 +1712,8 @@ function createDOMPurify(window = getGlobal()) {
   DOMPurify.clearConfig = function () {
     CONFIG = null;
     SET_CONFIG = false;
+    PRISTINE_ALLOWED_TAGS = null;
+    PRISTINE_ALLOWED_ATTR = null;
   };
 
   /**
@@ -1647,6 +1749,14 @@ function createDOMPurify(window = getGlobal()) {
       return;
     }
 
+    /* Reject unknown entry points. Without this, a non-hook key (e.g.
+     * '__proto__') indexes off the prototype chain rather than a real
+     * hook array, and arrayPush then writes to Object.prototype. Guard
+     * by matching against the known hook names. */
+    if (!_isValidHookEntryPoint(entryPoint)) {
+      return;
+    }
+
     hooks[entryPoint] = hooks[entryPoint] || [];
     arrayPush(hooks[entryPoint], hookFunction);
   };
@@ -1660,6 +1770,10 @@ function createDOMPurify(window = getGlobal()) {
    * @return {Function} removed(popped) hook
    */
   DOMPurify.removeHook = function (entryPoint) {
+    if (!_isValidHookEntryPoint(entryPoint)) {
+      return undefined;
+    }
+
     if (hooks[entryPoint]) {
       return arrayPop(hooks[entryPoint]);
     }
@@ -1672,6 +1786,10 @@ function createDOMPurify(window = getGlobal()) {
    * @param  {String} entryPoint entry point for the hooks to remove
    */
   DOMPurify.removeHooks = function (entryPoint) {
+    if (!_isValidHookEntryPoint(entryPoint)) {
+      return;
+    }
+
     if (hooks[entryPoint]) {
       hooks[entryPoint] = [];
     }
