@@ -39,6 +39,18 @@ const arrayPop = unapply(Array.prototype.pop);
 const arrayPush = unapply(Array.prototype.push);
 const arraySlice = unapply(Array.prototype.slice);
 
+/* Identity sets. Set is missing in some supported engines (IE10), so fall
+   back to a plain array there: only add and membership are needed. */
+const setCreate = typeof Set === 'function' ? unconstruct(Set) : () => [];
+const setAdd =
+  typeof Set === 'function'
+    ? unapply(Set.prototype.add)
+    : (set, value) => arrayPush(set, value);
+const setHas =
+  typeof Set === 'function'
+    ? unapply(Set.prototype.has)
+    : (set, value) => arrayIndexOf(set, value) !== -1;
+
 const stringToLowerCase = unapply(String.prototype.toLowerCase);
 const stringToString = unapply(String.prototype.toString);
 const stringMatch = unapply(String.prototype.match);
@@ -149,6 +161,10 @@ export {
   seal,
   // RegExp
   regExpTest,
+  // Set
+  setAdd,
+  setCreate,
+  setHas,
   // String
   stringIndexOf,
   stringMatch,

@@ -4551,5 +4551,342 @@
         );
       }
     );
+
+    // ---------------------------------------------------------------------------
+    // IN_PLACE: a hook that removes a parent or sibling leaves the detached
+    // subtree's event handlers armed (GHSA-mrv2-3pqr-j5jr, incomplete fix
+    // for GHSA-p98j-92pf-mc4p / CVE-2026-75838).
+    //
+    // The inline neutralize above only notices a hook detaching the node it
+    // was called for. A hook that detaches some OTHER node - the current
+    // node's parent or a further ancestor, a sibling the walk has not reached
+    // yet, an unrelated not-yet-visited subtree, or a subtree it moves out of
+    // the root - takes that subtree out of the walker's reach unsanitized,
+    // and it is not in DOMPurify.removed either. The IN_PLACE exit now
+    // neutralizes every element that was under the root when sanitize()
+    // started and is no longer under it, whatever detached it. Same shape as
+    // the tests above: onerror without src, assert the attribute is gone.
+    // ---------------------------------------------------------------------------
+
+    QUnit.module(
+      'IN_PLACE: elements a hook detached while sanitizing another node are neutralized (GHSA-mrv2-3pqr-j5jr)',
+      function (hooks) {
+        var purify;
+        hooks.beforeEach(function () {
+          purify = DOMPurify(window);
+        });
+        hooks.afterEach(function () {
+          purify.removeAllHooks();
+          purify.clearConfig();
+        });
+
+        /* Detach a node without relying on Element.prototype.remove. */
+        function _detach(node) {
+          if (node.parentNode) {
+            node.parentNode.removeChild(node);
+          }
+        }
+
+        /* ES5 custom element constructor: karma transpiles `class`, and a
+           transpiled class cannot extend HTMLElement. */
+        function _defineReactionElement(name, onAttributeRemoved) {
+          if (window.customElements.get(name)) {
+            return;
+          }
+
+          var HTMLElementCtor = window.HTMLElement;
+          function ReactionElement() {
+            return Reflect.construct(HTMLElementCtor, [], ReactionElement);
+          }
+
+          ReactionElement.prototype = Object.create(
+            HTMLElementCtor.prototype
+          );
+          ReactionElement.prototype.constructor = ReactionElement;
+          Object.setPrototypeOf(ReactionElement, HTMLElementCtor);
+          ReactionElement.observedAttributes = ['onclick'];
+          ReactionElement.prototype.attributeChangedCallback = function (
+            attrName,
+            oldValue,
+            newValue
+          ) {
+            if (newValue === null) {
+              onAttributeRemoved(this);
+            }
+          };
+
+          window.customElements.define(name, ReactionElement);
+        }
+
+        function _supportsCustomElements() {
+          return (
+            typeof window.customElements !== 'undefined' &&
+            typeof Reflect !== 'undefined' &&
+            typeof Reflect.construct === 'function' &&
+            typeof Object.setPrototypeOf === 'function'
+          );
+        }
+
+        [
+          'uponSanitizeElement',
+          'beforeSanitizeElements',
+          'afterSanitizeElements',
+          'beforeSanitizeAttributes',
+          'afterSanitizeAttributes',
+        ].forEach(function (hook) {
+          QUnit.test(
+            'IN_PLACE: ' +
+              hook +
+              ' detaching a node other than its own neutralizes it (GHSA-mrv2-3pqr-j5jr)',
+            function (assert) {
+              var elsewhere = document.createElement('div');
+              // Element references are captured up front rather than read
+              // via nextElementSibling, which not every DOM implementation
+              // provides.
+              var shapes = {
+                parent: function (refs) {
+                  _detach(refs.figure);
+                },
+                ancestor: function (refs) {
+                  _detach(refs.section);
+                },
+                'later sibling': function (refs) {
+                  _detach(refs.tail);
+                },
+                'unvisited subtree': function (refs) {
+                  _detach(refs.far);
+                },
+                'moved out of root': function (refs) {
+                  elsewhere.appendChild(refs.figure);
+                },
+              };
+
+              Object.keys(shapes).forEach(function (shape) {
+                var root = document.createElement('div');
+                root.innerHTML =
+                  '<section><figure><i></i>' +
+                  '<img id="tail" onerror="alert(1)"></figure></section>' +
+                  '<p>ok</p>' +
+                  '<aside id="far"><img id="far-tail" onerror="alert(2)">' +
+                  '</aside>';
+                var refs = {
+                  section: root.querySelector('section'),
+                  figure: root.querySelector('figure'),
+                  tail: root.querySelector('#tail'),
+                  far: root.querySelector('#far'),
+                };
+                var tail = refs.tail;
+                var farTail = root.querySelector('#far-tail');
+                var fired = false;
+
+                purify.addHook(hook, function (node) {
+                  if (!fired && node.nodeName === 'I') {
+                    fired = true;
+                    shapes[shape](refs);
+                  }
+                });
+
+                try {
+                  var ret = purify.sanitize(root, { IN_PLACE: true });
+                  assert.equal(ret, root, shape + ': returns the root');
+                  assert.ok(fired, shape + ': hook ran');
+                  assert.strictEqual(
+                    tail.getAttribute('onerror'),
+                    null,
+                    shape + ': handler stripped from #tail'
+                  );
+                  assert.strictEqual(
+                    farTail.getAttribute('onerror'),
+                    null,
+                    shape + ': handler stripped from #far-tail'
+                  );
+                } finally {
+                  purify.removeHook(hook);
+                }
+              });
+            }
+          );
+        });
+
+        QUnit.test(
+          'IN_PLACE: an element detached by the hook of another node keeps its allow-listed attributes (GHSA-mrv2-3pqr-j5jr)',
+          function (assert) {
+            var root = document.createElement('div');
+            root.innerHTML =
+              '<figure onclick="alert(1)"><i></i>' +
+              '<img id="tail" class="keep" title="t" onerror="alert(2)">' +
+              '</figure><p class="x" onmouseover="alert(3)">ok</p>';
+            var figure = root.querySelector('figure');
+            var tail = root.querySelector('#tail');
+            var kept = root.querySelector('p');
+
+            purify.addHook('afterSanitizeElements', function (node) {
+              if (node.nodeName === 'I' && figure.parentNode) {
+                _detach(figure);
+              }
+            });
+
+            purify.sanitize(root, { IN_PLACE: true });
+
+            assert.strictEqual(
+              figure.getAttribute('onclick'),
+              null,
+              'handler stripped from the detached parent'
+            );
+            assert.strictEqual(
+              tail.getAttribute('onerror'),
+              null,
+              'handler stripped from the detached sibling'
+            );
+            assert.equal(
+              tail.getAttribute('class'),
+              'keep',
+              'allow-listed attributes on escaped nodes are left alone'
+            );
+            assert.equal(
+              tail.getAttribute('title'),
+              't',
+              'allow-listed attributes on escaped nodes are left alone'
+            );
+            assert.equal(
+              root.innerHTML,
+              '<p class="x">ok</p>',
+              'the remaining in-place tree is sanitized as before'
+            );
+            assert.equal(kept.parentNode, root, 'kept node stays in place');
+          }
+        );
+
+        // In 2.x uponSanitizeShadowNode fires for the nodes of a
+        // <template>.content walk; a hook there can detach a light-DOM
+        // sibling of the template that the main walk has not reached yet.
+        QUnit.test(
+          'IN_PLACE: uponSanitizeShadowNode detaching a sibling neutralizes it (GHSA-mrv2-3pqr-j5jr)',
+          function (assert) {
+            var probe = document.createElement('template');
+            if (!probe.content) {
+              assert.ok(true, 'no <template> in this engine; skipping');
+              return;
+            }
+
+            var root = document.createElement('div');
+            root.innerHTML =
+              '<template><i></i></template>' +
+              '<b><img id="tail" onerror="alert(1)"></b><p>ok</p>';
+            var tail = root.querySelector('#tail');
+            var sibling = root.querySelector('b');
+            var fired = false;
+
+            purify.addHook('uponSanitizeShadowNode', function (node) {
+              if (node.nodeName === 'I' && sibling.parentNode) {
+                fired = true;
+                _detach(sibling);
+              }
+            });
+
+            purify.sanitize(root, { IN_PLACE: true });
+
+            assert.ok(fired, 'hook ran');
+            assert.strictEqual(
+              tail.getAttribute('onerror'),
+              null,
+              'handler stripped from the sibling a shadow-node hook detached'
+            );
+          }
+        );
+
+        QUnit.test(
+          'IN_PLACE: a custom element reaction detaching a sibling neutralizes it, no hook involved (GHSA-mrv2-3pqr-j5jr)',
+          function (assert) {
+            // DOMPurify's own removeAttribute('onclick') on an allowed custom
+            // element runs the page's attributeChangedCallback synchronously,
+            // which detaches the next sibling before the walk reaches it.
+            if (!_supportsCustomElements()) {
+              assert.ok(true, 'no custom elements in this engine; skipping');
+              return;
+            }
+
+            _defineReactionElement('inplace-sibling-surgeon', function (el) {
+              var next = el.nextElementSibling;
+              if (next) {
+                _detach(next);
+              }
+            });
+
+            var root = document.createElement('div');
+            // Connected, so the element is upgraded and its reactions run.
+            document.body.appendChild(root);
+            root.innerHTML =
+              '<inplace-sibling-surgeon onclick="x"></inplace-sibling-surgeon>' +
+              '<b><img id="tail" onerror="alert(1)"></b>';
+            var tail = root.querySelector('#tail');
+
+            try {
+              purify.sanitize(root, {
+                IN_PLACE: true,
+                CUSTOM_ELEMENT_HANDLING: { tagNameCheck: /^inplace-/ },
+              });
+              assert.strictEqual(
+                tail.getAttribute('onerror'),
+                null,
+                'handler stripped from the sibling a reaction detached'
+              );
+            } finally {
+              root.parentNode.removeChild(root);
+            }
+          }
+        );
+
+        QUnit.test(
+          'IN_PLACE: a node detached by the hook of another node is neutralized on the abort path too (GHSA-mrv2-3pqr-j5jr)',
+          function (assert) {
+            var root = document.createElement('div');
+            root.innerHTML =
+              '<figure><i></i><img id="tail" onerror="alert(1)"></figure>' +
+              '<p>ok</p>';
+            var tail = root.querySelector('#tail');
+
+            purify.addHook('afterSanitizeAttributes', function (node) {
+              if (node.nodeName === 'I') {
+                _detach(node.parentNode);
+                throw new Error('hook failure after detaching');
+              }
+            });
+
+            assert.throws(
+              function () {
+                purify.sanitize(root, { IN_PLACE: true });
+              },
+              /hook failure after detaching/,
+              'the hook error propagates'
+            );
+            assert.strictEqual(
+              tail.getAttribute('onerror'),
+              null,
+              'handler stripped before the rethrow'
+            );
+          }
+        );
+
+        QUnit.test(
+          'Non-IN_PLACE: a hook detaching a parent still drops it from the output (GHSA-mrv2-3pqr-j5jr)',
+          function (assert) {
+            purify.addHook('uponSanitizeElement', function (node) {
+              if (node.nodeName === 'I' && node.parentNode) {
+                _detach(node.parentNode);
+              }
+            });
+
+            assert.equal(
+              purify.sanitize(
+                '<figure><i></i><img src=x onerror=alert(1)></figure><b>ok</b>'
+              ),
+              '<b>ok</b>',
+              'string path output is unchanged'
+            );
+          }
+        );
+      }
+    );
   };
 });
