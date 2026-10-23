@@ -765,6 +765,140 @@
         });
       }
     );
+    QUnit.test(
+      'Config-Flag tests: IN_PLACE throws instead of returning a force-removed rawtext root (mXSS reparse) CVE-2026-109345',
+      function (assert) {
+        // A <style> passed as the IN_PLACE root whose text content already
+        // carries its own end tag is force-removed by the mXSS text probe:
+        // its literal serialization ("</style><img ...>") re-opens markup on
+        // an HTML reparse. Attribute sanitization cancels the attribute axis
+        // (the onclick below) but cannot defang rawtext text, so the removed
+        // root must not be handed back to the caller. Fail closed - assert
+        // the return contract, not merely a scrubbed textContent.
+        var dirty = document.createElement('style');
+        dirty.setAttribute('onclick', 'alert(1)');
+        dirty.textContent = '</style><img src=x onerror=alert(1)>';
+        document.body.appendChild(dirty);
+
+        try {
+          assert.throws(
+            function () {
+              DOMPurify.sanitize(dirty, { IN_PLACE: true });
+            },
+            /refusing to sanitize in place/,
+            'force-removed rawtext root is not returned'
+          );
+
+          var recorded = false;
+          for (var i = 0; i < DOMPurify.removed.length; i++) {
+            if (DOMPurify.removed[i].element === dirty) {
+              recorded = true;
+            }
+          }
+
+          assert.ok(
+            recorded,
+            'root was recorded as removed during the aborted call'
+          );
+        } finally {
+          if (dirty.parentNode) {
+            dirty.parentNode.removeChild(dirty);
+          }
+
+          window.xssed = false;
+        }
+      }
+    );
+    QUnit.test(
+      'Config-Flag tests: IN_PLACE throws for a parent-less force-removed rawtext root CVE-2026-109345',
+      function (assert) {
+        // A parent-less root cannot be detached by _forceRemove at all, so
+        // without the fail-closed check the very same node - text payload
+        // intact - came back to the caller, and storing / re-rendering its
+        // outerHTML produced a live <img onerror>. No src on the payload, so
+        // the probe below cannot actually fire it.
+        var dirty = document.createElement('style');
+        dirty.textContent = '</style><img onerror=alert(1)>';
+
+        var returned = null;
+        assert.throws(
+          function () {
+            returned = DOMPurify.sanitize(dirty, { IN_PLACE: true });
+          },
+          /refusing to sanitize in place/,
+          'parent-less force-removed rawtext root is not returned'
+        );
+
+        var probe = document.createElement('div');
+        probe.innerHTML = returned ? returned.outerHTML : '';
+        assert.notOk(
+          probe.querySelector('[onerror],[onload],script'),
+          'no executable sink is handed back for re-rendering: ' +
+            probe.innerHTML
+        );
+      }
+    );
+    QUnit.test(
+      'Config-Flag tests: IN_PLACE throws for a root force-removed by the select/template check CVE-2026-109345',
+      function (assert) {
+        // The check is not tied to the rawtext probe: any root-kill reason
+        // (here the <select> + <template> mitigation) must fail closed
+        // rather than return the removed root.
+        var dirty = document.createElement('select');
+        dirty.appendChild(document.createElement('template'));
+        document.body.appendChild(dirty);
+
+        try {
+          assert.throws(
+            function () {
+              DOMPurify.sanitize(dirty, { IN_PLACE: true });
+            },
+            /refusing to sanitize in place/,
+            'force-removed select root is not returned'
+          );
+        } finally {
+          if (dirty.parentNode) {
+            dirty.parentNode.removeChild(dirty);
+          }
+        }
+      }
+    );
+    QUnit.test(
+      'Config-Flag tests: IN_PLACE still returns the root when a rawtext CHILD (not the root) is removed CVE-2026-109345',
+      function (assert) {
+        // The fail-closed guard must fire ONLY when the ROOT itself is
+        // force-removed. A dangerous rawtext child is detached from the
+        // returned root as usual; the root remains safe to return, so the
+        // guard must not over-trigger on ordinary child removals.
+        var dirty = document.createElement('div');
+        dirty.innerHTML = '<span>ok</span>';
+        var style = document.createElement('style');
+        style.textContent = '</style><img src=x onerror=alert(1)>';
+        dirty.appendChild(style);
+        document.body.appendChild(dirty);
+
+        try {
+          var clean = DOMPurify.sanitize(dirty, { IN_PLACE: true });
+          assert.equal(clean, dirty, 'returns the input root');
+          assert.equal(
+            dirty.querySelector('style'),
+            null,
+            'dangerous rawtext child removed from the returned root'
+          );
+          assert.equal(
+            dirty.querySelector('span').textContent,
+            'ok',
+            'safe sibling content preserved'
+          );
+        } finally {
+          if (dirty.parentNode) {
+            dirty.parentNode.removeChild(dirty);
+          }
+
+          window.xssed = false;
+        }
+      }
+    );
     QUnit.test('Config-Flag tests: FORBID_TAGS', function (assert) {
       //FORBID_TAGS
       assert.equal(
@@ -4094,13 +4228,26 @@
           }
         }
 
-        ['uponSanitizeElement', 'beforeSanitizeElements'].forEach(function (
-          hook
-        ) {
+        // Covers every per-node hook site that can detach the node: the
+        // original before/upon element sites and the afterSanitizeElements /
+        // beforeSanitizeAttributes / afterSanitizeAttributes sites the first
+        // fix left open (the after* hooks are the documented place for
+        // node.remove() policies) (CVE-2026-109345).
+        [
+          { hook: 'uponSanitizeElement', id: 'CVE-2026-75838' },
+          { hook: 'beforeSanitizeElements', id: 'CVE-2026-75838' },
+          { hook: 'afterSanitizeElements', id: 'CVE-2026-109345' },
+          { hook: 'beforeSanitizeAttributes', id: 'CVE-2026-109345' },
+          { hook: 'afterSanitizeAttributes', id: 'CVE-2026-109345' },
+        ].forEach(function (site) {
+          var hook = site.hook;
+
           QUnit.test(
             'IN_PLACE: ' +
               hook +
-              ' node.remove() neutralizes the detached subtree (CVE-2026-75838)',
+              ' node.remove() neutralizes the detached subtree (' +
+              site.id +
+              ')',
             function (assert) {
               var root = document.createElement('div');
               root.innerHTML =
@@ -4141,7 +4288,9 @@
           QUnit.test(
             'IN_PLACE: ' +
               hook +
-              ' detached deep subtree keeps only allowed attributes (CVE-2026-75838)',
+              ' detached deep subtree keeps only allowed attributes (' +
+              site.id +
+              ')',
             function (assert) {
               var root = document.createElement('div');
               root.innerHTML =
@@ -4199,6 +4348,43 @@
             }
           );
         });
+
+        // The afterSanitizeElements site that runs on a custom element kept
+        // via CUSTOM_ELEMENT_HANDLING (GHSA-c2j3-45gr-mqc4) is a separate hook
+        // site from the normal-element tail and needs the same detach
+        // re-check.
+        QUnit.test(
+          'IN_PLACE: afterSanitizeElements node.remove() on a kept custom element neutralizes the detached subtree (CVE-2026-109345)',
+          function (assert) {
+            var root = document.createElement('div');
+            root.innerHTML =
+              '<x-wrap><img id="tail" onerror="alert(1)"></x-wrap>' +
+              '<div>safe</div>';
+            var tail = root.querySelector('#tail');
+
+            purify.addHook('afterSanitizeElements', function (node) {
+              if (node.nodeName === 'X-WRAP') {
+                _detach(node);
+              }
+            });
+
+            var ret = purify.sanitize(root, {
+              IN_PLACE: true,
+              CUSTOM_ELEMENT_HANDLING: { tagNameCheck: /^x-/ },
+            });
+
+            assert.equal(ret, root, 'returns the same in-place node');
+            assert.notOk(
+              ret.querySelector('x-wrap, #tail'),
+              'detached subtree is absent from the returned tree'
+            );
+            assert.strictEqual(
+              tail.getAttribute('onerror'),
+              null,
+              'on* handler stripped from the hook-detached descendant'
+            );
+          }
+        );
 
         QUnit.test(
           'IN_PLACE: a hook-detached clobbered form subtree is neutralized (CVE-2026-75838)',
