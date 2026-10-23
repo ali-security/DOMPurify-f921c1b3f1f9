@@ -3750,5 +3750,213 @@
         );
       }
     );
+
+    // ---------------------------------------------------------------------------
+    // IN_PLACE trusts attacker-controlled nodeName (GHSA-x4vx-rjvf-j5p4).
+    //
+    // A live node handed to IN_PLACE sanitization by a lower-trust same-origin
+    // context (an iframe, a popup, an adopted node) can carry an own `nodeName`
+    // property shadowing Node.prototype.nodeName, e.g. a real <script> that
+    // reports 'DIV'. _isClobbered only inspects <form> elements, so the spoofed
+    // name decided the allow/forbid check and the script survived, executing
+    // once the host inserted the sanitized subtree. The tag name is now read
+    // through the cached Node.prototype.nodeName getter in the element check,
+    // the attribute check and the IN_PLACE root pre-check.
+    // ---------------------------------------------------------------------------
+
+    QUnit.module(
+      'IN_PLACE: spoofed nodeName (GHSA-x4vx-rjvf-j5p4)',
+      function (hooks) {
+        var purify;
+        hooks.beforeEach(function () {
+          purify = DOMPurify(window);
+        });
+        hooks.afterEach(function () {
+          purify.removeAllHooks();
+          purify.clearConfig();
+          window.__x4vxFired = undefined;
+        });
+
+        /* Shadows Node.prototype.nodeName on this one node, as the advisory's
+           PoC does: Object.defineProperty(script, 'nodeName', {value: 'DIV'}) */
+        function spoofNodeName(node, name) {
+          Object.defineProperty(node, 'nodeName', {
+            configurable: true,
+            value: name,
+          });
+          return node;
+        }
+
+        /* Inserts the sanitized subtree into the live document - the step
+           at which a surviving <script> fires - and reports whether the
+           payload ran. Engines that do not run scripts (jsdom) report false
+           and rely on the structural assertions. */
+        function payloadFiresOnInsert(node) {
+          window.__x4vxFired = false;
+          if (document.body) {
+            document.body.appendChild(node);
+            document.body.removeChild(node);
+          }
+
+          return window.__x4vxFired === true;
+        }
+
+        var payload = 'window.__x4vxFired = true;';
+
+        QUnit.test(
+          'IN_PLACE: <script> below the root reporting nodeName "DIV" is removed (GHSA-x4vx-rjvf-j5p4)',
+          function (assert) {
+            var wrapper = document.createElement('div');
+            var script = document.createElement('script');
+            script.textContent = payload;
+            spoofNodeName(script, 'DIV');
+            wrapper.appendChild(script);
+            assert.equal(script.nodeName, 'DIV', 'precondition: spoofed');
+
+            var clean = purify.sanitize(wrapper, { IN_PLACE: true });
+
+            assert.equal(clean, wrapper, 'the root is returned');
+            assert.equal(
+              wrapper.getElementsByTagName('script').length,
+              0,
+              'spoofed <script> must be removed: ' + wrapper.innerHTML
+            );
+            assert.notOk(
+              payloadFiresOnInsert(wrapper),
+              'no script fires when the sanitized node is inserted'
+            );
+          }
+        );
+
+        QUnit.test(
+          'IN_PLACE: forbidden elements spoofing an allowed nodeName are removed (GHSA-x4vx-rjvf-j5p4)',
+          function (assert) {
+            ['script', 'iframe', 'object', 'embed'].forEach(function (tag) {
+              var wrapper = document.createElement('div');
+              wrapper.appendChild(
+                spoofNodeName(document.createElement(tag), 'SPAN')
+              );
+
+              purify.sanitize(wrapper, { IN_PLACE: true });
+
+              assert.equal(
+                wrapper.getElementsByTagName(tag).length,
+                0,
+                '<' + tag + '> reporting nodeName "SPAN" must be removed'
+              );
+            });
+          }
+        );
+
+        QUnit.test(
+          'IN_PLACE: flip-flopping nodeName getter cannot pass a <script> (GHSA-x4vx-rjvf-j5p4)',
+          function (assert) {
+            var wrapper = document.createElement('div');
+            var script = document.createElement('script');
+            script.textContent = payload;
+            /* Alternates between the real and a spoofed name, so a check
+               reading the property more than once sees different values */
+            var reads = 0;
+            Object.defineProperty(script, 'nodeName', {
+              configurable: true,
+              get: function () {
+                reads++;
+                return reads % 2 ? 'SCRIPT' : 'DIV';
+              },
+            });
+            wrapper.appendChild(script);
+
+            purify.sanitize(wrapper, { IN_PLACE: true });
+
+            assert.equal(
+              wrapper.getElementsByTagName('script').length,
+              0,
+              'flip-flopping <script> must be removed: ' + wrapper.innerHTML
+            );
+            assert.notOk(
+              payloadFiresOnInsert(wrapper),
+              'no script fires when the sanitized node is inserted'
+            );
+          }
+        );
+
+        QUnit.test(
+          'IN_PLACE: parent-less <script> root reporting nodeName "DIV" is refused (GHSA-x4vx-rjvf-j5p4)',
+          function (assert) {
+            /* _forceRemove can not detach a root without a parent, so the
+               root pre-check is the only gate for the root itself. */
+            var root = document.createElement('script');
+            root.textContent = payload;
+            spoofNodeName(root, 'DIV');
+
+            assert.throws(
+              function () {
+                purify.sanitize(root, { IN_PLACE: true });
+              },
+              /forbidden/i,
+              'IN_PLACE must refuse a <script> root that reports "DIV"'
+            );
+          }
+        );
+
+        QUnit.test(
+          'IN_PLACE: spoofed nodeName does not unlock tag-specific data: URIs (GHSA-x4vx-rjvf-j5p4)',
+          function (assert) {
+            /* data: URIs are only accepted for DATA_URI_TAGS such as <img>;
+               an <a> reporting "IMG" must not get its data: href through */
+            var wrapper = document.createElement('div');
+            var link = document.createElement('a');
+            link.setAttribute(
+              'href',
+              'data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=='
+            );
+            spoofNodeName(link, 'IMG');
+            wrapper.appendChild(link);
+
+            purify.sanitize(wrapper, { IN_PLACE: true });
+
+            var a = wrapper.getElementsByTagName('a')[0];
+            assert.ok(a, 'the <a> itself is allowed and kept');
+            assert.notOk(
+              a && a.hasAttribute('href'),
+              'data: href on a spoofed <a> must be removed: ' + wrapper.innerHTML
+            );
+          }
+        );
+
+        QUnit.test(
+          'IN_PLACE: cross-realm <script> reporting nodeName "DIV" is removed (GHSA-x4vx-rjvf-j5p4)',
+          function (assert) {
+            var ran = _withForeignRealmDocument(function (foreignDocument) {
+              /* The advisory's flow: a same-origin iframe builds the
+                 container and the spoofed script, the host sanitizes it in
+                 place and inserts it into its own document. */
+              var container = foreignDocument.createElement('div');
+              var script = foreignDocument.createElement('script');
+              script.textContent = payload;
+              spoofNodeName(script, 'DIV');
+              container.appendChild(script);
+
+              purify.sanitize(container, { IN_PLACE: true });
+
+              assert.equal(
+                container.getElementsByTagName('script').length,
+                0,
+                'foreign-realm spoofed <script> must be removed: ' +
+                  container.innerHTML
+              );
+              assert.notOk(
+                payloadFiresOnInsert(container),
+                'no script fires when the sanitized node is inserted'
+              );
+            });
+
+            if (!ran) {
+              assert.ok(true, 'SKIP: cannot construct a foreign-realm document');
+            }
+          }
+        );
+      }
+    );
   };
 });
