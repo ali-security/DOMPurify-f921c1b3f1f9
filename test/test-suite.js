@@ -2637,5 +2637,394 @@
         }
       }
     );
+
+    // -------------------------------------------------------------------
+    // GHSA-r47g-fvhr-h676 - parent-less clobbered IN_PLACE root retains
+    // attacker-controlled attributes. _forceRemove cannot detach a root
+    // without a parent and _sanitizeAttributes early-returns on
+    // _isClobbered, so any event-handler attribute on the root survived.
+    // sanitize() must instead throw on a clobbered IN_PLACE root, the same
+    // way it throws on a forbidden root tag.
+    // -------------------------------------------------------------------
+
+    /* Returns true when this engine implements HTMLFormElement
+     * [LegacyOverrideBuiltIns] named-property clobbering for forms created
+     * by `ownerDocument` (real browsers do; jsdom does not). */
+    function _formClobberingSupported(ownerDocument) {
+      try {
+        var probeForm = ownerDocument.createElement('form');
+        var probeInput = ownerDocument.createElement('input');
+        probeInput.setAttribute('name', 'attributes');
+        probeForm.appendChild(probeInput);
+        return probeForm.attributes === probeInput;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    /* Names covered by _isClobbered's checklist. */
+    var _clobberNames = [
+      'attributes',
+      'nodeName',
+      'textContent',
+      'removeChild',
+      'removeAttribute',
+      'setAttribute',
+      'namespaceURI',
+      'insertBefore',
+      'hasChildNodes',
+    ];
+
+    QUnit.test(
+      'IN_PLACE: parent-less clobbered form root throws instead of returning the root with onmouseover intact (GHSA-r47g-fvhr-h676)',
+      function (assert) {
+        if (!_formClobberingSupported(document)) {
+          assert.ok(true, 'SKIP: no form clobbering in this engine');
+          return;
+        }
+
+        _clobberNames.forEach(function (name) {
+          var root = document.createElement('form');
+          root.setAttribute('onmouseover', 'alert(1)');
+          var clobber = document.createElement('input');
+          clobber.setAttribute('name', name);
+          root.appendChild(clobber);
+
+          assert.throws(
+            function () {
+              DOMPurify.sanitize(root, { IN_PLACE: true });
+            },
+            /clobbered|forbidden/i,
+            'IN_PLACE must refuse a root clobbered by name="' + name + '"'
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'IN_PLACE: a parented clobbered form is still removed without throwing (GHSA-r47g-fvhr-h676)',
+      function (assert) {
+        if (!_formClobberingSupported(document)) {
+          assert.ok(true, 'SKIP: no form clobbering in this engine');
+          return;
+        }
+
+        var wrapper = document.createElement('div');
+        var form = document.createElement('form');
+        form.setAttribute('onmouseover', 'alert(1)');
+        var clobber = document.createElement('input');
+        clobber.setAttribute('name', 'attributes');
+        form.appendChild(clobber);
+        wrapper.appendChild(form);
+
+        var clean = DOMPurify.sanitize(wrapper, { IN_PLACE: true });
+
+        assert.equal(clean, wrapper, 'the wrapper root is returned');
+        assert.equal(
+          wrapper.getElementsByTagName('form').length,
+          0,
+          'parented clobbered form is removed by the iterator-driven path'
+        );
+        assert.notOk(
+          /onmouseover/i.test(wrapper.innerHTML),
+          'no handler survived: ' + wrapper.innerHTML
+        );
+      }
+    );
+
+    QUnit.test(
+      'IN_PLACE: an unclobbered form root is still accepted (GHSA-r47g-fvhr-h676)',
+      function (assert) {
+        var root = document.createElement('form');
+        root.setAttribute('onmouseover', 'alert(1)');
+        root.setAttribute('class', 'kept');
+        root.appendChild(document.createElement('input'));
+
+        var clean = DOMPurify.sanitize(root, { IN_PLACE: true });
+
+        assert.equal(clean, root, 'the root is returned');
+        assert.notOk(root.hasAttribute('onmouseover'), 'handler is removed');
+        assert.equal(root.getAttribute('class'), 'kept', 'safe attr is kept');
+        assert.equal(
+          root.getElementsByTagName('input').length,
+          1,
+          'safe child is kept'
+        );
+      }
+    );
+
+    // -------------------------------------------------------------------
+    // GHSA-hpcv-96wg-7vj8 - cross-realm IN_PLACE sanitization. Nodes
+    // created in another same-origin realm (e.g. an iframe's document)
+    // pass the realm-agnostic _isNode check, but several downstream
+    // security decisions used `instanceof` against the parent realm's
+    // constructors (HTMLFormElement, NamedNodeMap, DocumentFragment,
+    // Element). Each check short-circuited to false for foreign-realm
+    // nodes and the matching sanitization branch was skipped: form
+    // clobbering went undetected, <template>.content was never walked and
+    // the namespace check was bypassed. (DOMPurify 2.x has no attached-
+    // shadow-root pass, so the advisory's shadow-root variant has no 2.x
+    // counterpart.)
+    // -------------------------------------------------------------------
+
+    /* Runs `callback(foreignDocument)` against the document of a fresh
+     * same-origin iframe, i.e. a document whose nodes belong to a different
+     * realm than the DOMPurify instance under test. Returns false (so the
+     * caller can skip) when the environment cannot provide one. Exceptions
+     * thrown by the callback are not swallowed. */
+    function _withForeignRealmDocument(callback) {
+      var iframe = null;
+      var foreignDocument = null;
+
+      try {
+        if (document.body) {
+          iframe = document.createElement('iframe');
+          document.body.appendChild(iframe);
+          foreignDocument = iframe.contentDocument;
+        }
+      } catch (_) {
+        foreignDocument = null;
+      }
+
+      if (
+        !foreignDocument ||
+        typeof foreignDocument.createElement !== 'function' ||
+        /* The document must really belong to another realm, otherwise the
+           tests would not exercise the cross-realm code paths. */
+        foreignDocument.createElement('div') instanceof window.Element
+      ) {
+        if (iframe && iframe.parentNode) {
+          iframe.parentNode.removeChild(iframe);
+        }
+
+        return false;
+      }
+
+      try {
+        callback(foreignDocument);
+      } finally {
+        if (iframe.parentNode) {
+          iframe.parentNode.removeChild(iframe);
+        }
+      }
+
+      return true;
+    }
+
+    QUnit.test(
+      'IN_PLACE: cross-realm clobbered form root is refused (GHSA-hpcv-96wg-7vj8)',
+      function (assert) {
+        var ran = _withForeignRealmDocument(function (foreignDocument) {
+          if (!_formClobberingSupported(foreignDocument)) {
+            assert.ok(
+              true,
+              'SKIP: foreign realm does not implement HTMLFormElement ' +
+                '[LegacyOverrideBuiltIns]; the bypass is not reproducible here'
+            );
+            return;
+          }
+
+          _clobberNames.forEach(function (name) {
+            var form = foreignDocument.createElement('form');
+            form.setAttribute('onmouseover', 'alert(1)');
+            var clobber = foreignDocument.createElement('input');
+            clobber.setAttribute('name', name);
+            form.appendChild(clobber);
+
+            // Before the fix `form instanceof HTMLFormElement` was false for
+            // the foreign-realm form, so it was never flagged as clobbered,
+            // the attribute walk read the clobbered .attributes and the
+            // onmouseover handler on the root survived.
+            assert.throws(
+              function () {
+                DOMPurify.sanitize(form, { IN_PLACE: true });
+              },
+              /clobbered|forbidden/i,
+              'foreign-realm root clobbered by name="' +
+                name +
+                '" must not be handed back'
+            );
+          });
+        });
+
+        if (!ran) {
+          assert.ok(true, 'SKIP: cannot construct a foreign-realm document');
+        }
+      }
+    );
+
+    QUnit.test(
+      'IN_PLACE: cross-realm clobbered form below the root is removed (GHSA-hpcv-96wg-7vj8)',
+      function (assert) {
+        var ran = _withForeignRealmDocument(function (foreignDocument) {
+          if (!_formClobberingSupported(foreignDocument)) {
+            assert.ok(
+              true,
+              'SKIP: foreign realm does not implement HTMLFormElement ' +
+                '[LegacyOverrideBuiltIns]; the bypass is not reproducible here'
+            );
+            return;
+          }
+
+          _clobberNames.forEach(function (name) {
+            var wrapper = foreignDocument.createElement('div');
+            var form = foreignDocument.createElement('form');
+            form.setAttribute('onmouseover', 'alert(1)');
+            form.setAttribute('action', 'javascript:alert(2)');
+            var clobber = foreignDocument.createElement('input');
+            clobber.setAttribute('name', name);
+            form.appendChild(clobber);
+            wrapper.appendChild(form);
+
+            DOMPurify.sanitize(wrapper, { IN_PLACE: true });
+
+            assert.equal(
+              wrapper.getElementsByTagName('form').length,
+              0,
+              'foreign-realm form clobbered by name="' +
+                name +
+                '" must be removed'
+            );
+            assert.notOk(
+              /onmouseover|javascript:/i.test(wrapper.innerHTML),
+              'no handler survived: ' + wrapper.innerHTML
+            );
+          });
+        });
+
+        if (!ran) {
+          assert.ok(true, 'SKIP: cannot construct a foreign-realm document');
+        }
+      }
+    );
+
+    QUnit.test(
+      'IN_PLACE: cross-realm unclobbered form is sanitized, not refused (GHSA-hpcv-96wg-7vj8)',
+      function (assert) {
+        var ran = _withForeignRealmDocument(function (foreignDocument) {
+          // Guards against over-flagging: the realm-independent
+          // .attributes probe must accept a clean foreign-realm form.
+          var form = foreignDocument.createElement('form');
+          form.setAttribute('onmouseover', 'alert(1)');
+          form.setAttribute('class', 'kept');
+          form.appendChild(foreignDocument.createElement('input'));
+
+          var clean = DOMPurify.sanitize(form, { IN_PLACE: true });
+
+          assert.equal(clean, form, 'the root is returned');
+          assert.notOk(form.hasAttribute('onmouseover'), 'handler removed');
+          assert.equal(form.getAttribute('class'), 'kept', 'safe attr kept');
+          assert.equal(
+            form.getElementsByTagName('input').length,
+            1,
+            'safe child is kept'
+          );
+        });
+
+        if (!ran) {
+          assert.ok(true, 'SKIP: cannot construct a foreign-realm document');
+        }
+      }
+    );
+
+    QUnit.test(
+      'IN_PLACE: cross-realm <template>.content is walked and sanitized (GHSA-hpcv-96wg-7vj8)',
+      function (assert) {
+        var ran = _withForeignRealmDocument(function (foreignDocument) {
+          var wrapper = foreignDocument.createElement('div');
+          var template = foreignDocument.createElement('template');
+          if (!template.content) {
+            assert.ok(true, 'SKIP: <template> is not supported here');
+            return;
+          }
+
+          // The nested <template> covers the deep-template recursion in
+          // _sanitizeShadowDOM, the outer one the main iterator.
+          template.innerHTML =
+            '<img src="x" onerror="alert(1)">' +
+            '<template><img src="y" onerror="alert(2)"></template>';
+          wrapper.appendChild(template);
+
+          // Before the fix `template.content instanceof DocumentFragment`
+          // was false for the foreign-realm fragment, so its contents were
+          // never walked and the onerror handlers survived.
+          DOMPurify.sanitize(wrapper, { IN_PLACE: true });
+
+          var img = template.content.querySelector('img');
+          assert.ok(img, 'template content was reached');
+          assert.equal(
+            img && img.getAttribute('onerror'),
+            null,
+            'onerror inside foreign-realm <template> must be stripped'
+          );
+
+          var inner = template.content.querySelector('template');
+          var innerImg = inner && inner.content.querySelector('img');
+          assert.ok(innerImg, 'nested template content was reached');
+          assert.equal(
+            innerImg && innerImg.getAttribute('onerror'),
+            null,
+            'onerror inside nested foreign-realm <template> must be stripped'
+          );
+        });
+
+        if (!ran) {
+          assert.ok(true, 'SKIP: cannot construct a foreign-realm document');
+        }
+      }
+    );
+
+    QUnit.test(
+      'IN_PLACE: cross-realm element in a forbidden namespace is removed (GHSA-hpcv-96wg-7vj8)',
+      function (assert) {
+        var build = function (ownerDocument) {
+          var wrapper = ownerDocument.createElement('div');
+          // Allowed tag names in namespaces _checkValidNamespace rejects: an
+          // unknown namespace, and an SVG element other than <svg> directly
+          // below an HTML element.
+          var bogus = ownerDocument.createElementNS(
+            'urn:example:not-allowed',
+            'div'
+          );
+          bogus.textContent = 'bogus';
+          wrapper.appendChild(bogus);
+          wrapper.appendChild(
+            ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'a')
+          );
+          return wrapper;
+        };
+
+        // Same-realm control: the namespace check removes both elements.
+        var sameRealm = build(document);
+        DOMPurify.sanitize(sameRealm, { IN_PLACE: true });
+        assert.equal(sameRealm.innerHTML, '', 'same-realm control is cleaned');
+
+        var ran = _withForeignRealmDocument(function (foreignDocument) {
+          // Before the fix _checkValidNamespace was gated behind
+          // `currentNode instanceof Element` (parent realm), so both
+          // elements slipped past the namespace check.
+          var wrapper = build(foreignDocument);
+          DOMPurify.sanitize(wrapper, { IN_PLACE: true });
+
+          assert.equal(
+            wrapper.getElementsByTagNameNS('urn:example:not-allowed', '*')
+              .length,
+            0,
+            'foreign-realm element in an unknown namespace must be removed'
+          );
+          assert.equal(
+            wrapper.getElementsByTagNameNS('http://www.w3.org/2000/svg', '*')
+              .length,
+            0,
+            'foreign-realm SVG <a> directly below HTML must be removed'
+          );
+          assert.equal(wrapper.innerHTML, '', 'foreign-realm wrapper cleaned');
+        });
+
+        if (!ran) {
+          assert.ok(true, 'SKIP: cannot construct a foreign-realm document');
+        }
+      }
+    );
   };
 });
